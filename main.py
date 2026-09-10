@@ -1,6 +1,8 @@
-import os, time, requests, threading
+import os, time, requests, threading, asyncio
 from flask import Flask
 from datetime import datetime, timedelta, timezone
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -14,6 +16,59 @@ def send_telegram(msg):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True}
     try: requests.post(url, json=payload, timeout=10)
     except: pass
+
+def send_telegram_ca(ca):
+    # Contrato aparte 100% copiable con un toque
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": f"`{ca}`", "parse_mode": "Markdown"}
+    try: requests.post(url, json=payload, timeout=10)
+    except: pass
+
+# --- COMANDO /start ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = []
+    for sym in TOKENIZED_STOCKS:
+        keyboard.append([InlineKeyboardButton(f"📈 {sym}", callback_data=f"info_{sym}")])
+    # 2 columnas para que se vea mejor
+    keyboard = [keyboard[i:i+2] for i in range(0, len(keyboard), 2)]
+    # aplanar lista de listas
+    flat_keyboard = []
+    for row in keyboard:
+        flat_keyboard.append(row)
+
+    reply_markup = InlineKeyboardMarkup(flat_keyboard)
+    await update.message.reply_text(
+        f"🤖 **BOT 20 xSTOCKS ACTIVO**\n\nMonitoreando {len(TOKENIZED_STOCKS)} acciones\n\n"
+        f"{', '.join(TOKENIZED_STOCKS)}\n\n"
+        f"Selecciona una para confirmar que está activa. Las alertas llegan automáticas:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    symbol = query.data.replace("info_", "")
+    await query.message.reply_text(
+        f"✅ **{symbol}** está siendo monitoreada.\n"
+        f"Filtros: Liquidez $6k-$80k | Edad 10min-18h | Buys >20 | Ratio >2.5x\n"
+        f"Cuando salga joya te mando alerta + contrato copiable.",
+        parse_mode='Markdown'
+    )
+
+def run_telegram_bot():
+    async def run():
+        app = Application.builder().token(TELEGRAM_TOKEN).build()
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CallbackQueryHandler(button_callback))
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        print("Bot Telegram /start activo")
+        while True:
+            await asyncio.sleep(3600)
+    asyncio.run(run())
 
 def check_pools():
     while True:
@@ -50,13 +105,19 @@ def check_pools():
                 score = 0; score += min(buys_h1*2, 40); ratio = buys_h1 / max(sells_h1,1); score += min(ratio*10, 30); score += min(vol_m5/100, 30); score = min(score,100)
                 if score < 75: continue
                 gecko_link = f"https://www.geckoterminal.com/robinhood/pools/{pool_address}"
-                msg = f"🚀 *NUEVA JOYA xSTOCK DETECTADA* 🚀\n\n*Pool:* {name}\n*Liquidez:* ${reserve_usd:.0f}\n*Buys 1h:* {buys_h1} | *Sells:* {sells_h1} | *Ratio:* {ratio:.1f}x\n*Vol 5m:* ${vol_m5:.0f} | *Vol 1h:* ${vol_h1:.0f}\n*Edad:* {int(age_minutes)} min\n*SCORE:* {score}/100 - ALTA\n\n{gecko_link}\n\nCA:\n`{ca}`"
-                send_telegram(msg); alerted_cas[ca] = datetime.now(); print(f"Alerta: {name} {score}")
+                msg = f"🚀 *NUEVA JOYA xSTOCK DETECTADA* 🚀\n\n*Pool:* {name}\n*Liquidez:* ${reserve_usd:.0f}\n*Buys 1h:* {buys_h1} | *Sells:* {sells_h1} | *Ratio:* {ratio:.1f}x\n*Vol 5m:* ${vol_m5:.0f} | *Vol 1h:* ${vol_h1:.0f}\n*Edad:* {int(age_minutes)} min\n*SCORE:* {score}/100 - ALTA\n\n{gecko_link}"
+                send_telegram(msg)
+                time.sleep(1)
+                send_telegram_ca(ca)
+                alerted_cas[ca] = datetime.now(); print(f"Alerta: {name} {score}")
             time.sleep(20)
         except Exception as e: print(f"Error: {e}"); time.sleep(30)
 
 app = Flask(__name__)
 @app.route('/')
 def home(): return "Bot 20 xStocks Activo - OK"
+
 threading.Thread(target=check_pools, daemon=True).start()
+threading.Thread(target=run_telegram_bot, daemon=True).start()
+
 if __name__ == "__main__": app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
