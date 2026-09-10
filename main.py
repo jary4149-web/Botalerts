@@ -1,36 +1,62 @@
-import os, time, requests
+import os, time, requests, threading
 from flask import Flask
-import threading
-app = Flask(__name__)
+from datetime import datetime, timedelta, timezone
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SYMBOL = "SPY"
-CHECK_SECONDS = 60
-last_price = None
+GECKO_API = "https://api.geckoterminal.com/api/v2"
+TOKENIZED_STOCKS = ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "AMD", "NFLX", "SPY", "QQQ", "MSTR", "HOOD", "COIN", "BA", "BABA", "NVO", "PLTR", "VOO", "GOOG"]
+alerted_cas = {}
+
 def send_telegram(msg):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True}
+    try: requests.post(url, json=payload, timeout=10)
     except: pass
-def get_price():
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{SYMBOL}"
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}).json()
-        return float(r["chart"]["result"][0]["meta"]["regularMarketPrice"])
-    except: return None
-def bot_loop():
-    global last_price
-    send_telegram(f"Bot iniciado {SYMBOL}")
+
+def check_pools():
     while True:
-        price = get_price()
-        if price:
-            if last_price is None: last_price = price
-            if abs(price-last_price) >= 0.5:
-                send_telegram(f"{SYMBOL}: ${price}")
-                last_price = price
-        time.sleep(CHECK_SECONDS)
-@app.route("/")
-def home(): return "Bot activo"
-threading.Thread(target=bot_loop, daemon=True).start()
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+        try:
+            r = requests.get(f"{GECKO_API}/networks/robinhood/pools?sort=created_at_desc&page=1", timeout=15).json()
+            pools = r.get('data', [])
+            for pool in pools:
+                attrs = pool.get('attributes', {})
+                pool_address = pool.get('id', '').split('_')[-1]
+                name = attrs.get('name', '')
+                created_at_str = attrs.get('pool_created_at')
+                reserve_usd = float(attrs.get('reserve_in_usd') or 0)
+                txs = attrs.get('transactions', {}); h1 = txs.get('h1', {}); m5 = txs.get('m5', {})
+                buys_h1 = int(h1.get('buys', 0)); sells_h1 = int(h1.get('sells', 0)); buys_m5 = int(m5.get('buys', 0))
+                volume = attrs.get('volume_usd', {}); vol_h1 = float(volume.get('h1', 0)); vol_m5 = float(volume.get('m5', 0))
+                if not any(t in name.upper() for t in TOKENIZED_STOCKS): continue
+                if reserve_usd < 6000 or reserve_usd > 80000: continue
+                if not created_at_str: continue
+                created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+                age_minutes = (datetime.now(timezone.utc) - created_at).total_seconds() / 60
+                if age_minutes < 10 or age_minutes > 18*60: continue
+                if sells_h1 == 0: sells_h1 = 1
+                if buys_h1 < 20: continue
+                if buys_h1 < (sells_h1 * 2.5): continue
+                if vol_h1 < 1000: continue
+                if vol_h1 > 0 and vol_m5 < (vol_h1 / 12 * 2): continue
+                if buys_m5 < 10: continue
+                try:
+                    base_token = pool.get('relationships', {}).get('base_token', {}).get('data', {}).get('id', '')
+                    ca = base_token.split('_')[-1]
+                    if not ca.startswith('0x'): ca = pool_address
+                except: ca = pool_address
+                if ca in alerted_cas and datetime.now() - alerted_cas[ca] < timedelta(hours=6): continue
+                score = 0; score += min(buys_h1*2, 40); ratio = buys_h1 / max(sells_h1,1); score += min(ratio*10, 30); score += min(vol_m5/100, 30); score = min(score,100)
+                if score < 75: continue
+                gecko_link = f"https://www.geckoterminal.com/robinhood/pools/{pool_address}"
+                msg = f"🚀 *NUEVA JOYA xSTOCK DETECTADA* 🚀\n\n*Pool:* {name}\n*Liquidez:* ${reserve_usd:.0f}\n*Buys 1h:* {buys_h1} | *Sells:* {sells_h1} | *Ratio:* {ratio:.1f}x\n*Vol 5m:* ${vol_m5:.0f} | *Vol 1h:* ${vol_h1:.0f}\n*Edad:* {int(age_minutes)} min\n*SCORE:* {score}/100 - ALTA\n\n{gecko_link}\n\nCA:\n`{ca}`"
+                send_telegram(msg); alerted_cas[ca] = datetime.now(); print(f"Alerta: {name} {score}")
+            time.sleep(20)
+        except Exception as e: print(f"Error: {e}"); time.sleep(30)
+
+app = Flask(__name__)
+@app.route('/')
+def home(): return "Bot 20 xStocks Activo - OK"
+threading.Thread(target=check_pools, daemon=True).start()
+if __name__ == "__main__": app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
