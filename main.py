@@ -1,8 +1,6 @@
-import os, time, requests, threading, asyncio
+import os, time, requests, threading
 from flask import Flask
 from datetime import datetime, timedelta, timezone
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -10,45 +8,48 @@ GECKO_API = "https://api.geckoterminal.com/api/v2"
 TOKENIZED_STOCKS = ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "AMD", "NFLX", "SPY", "QQQ", "MSTR", "HOOD", "COIN", "BA", "BABA", "NVO", "PLTR", "VOO", "GOOG"]
 alerted_cas = {}
 
-def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+def send_telegram(msg, chat_id=None, reply_markup=None):
+    if not TELEGRAM_TOKEN: return
+    cid = chat_id or TELEGRAM_CHAT_ID
+    if not cid: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True}
+    payload = {"chat_id": cid, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True}
+    if reply_markup: payload["reply_markup"] = reply_markup
     try: requests.post(url, json=payload, timeout=10)
     except: pass
 
-def send_telegram_ca(ca):
+def send_telegram_ca(ca, chat_id=None):
+    if not TELEGRAM_TOKEN: return
+    cid = chat_id or TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": f"`{ca}`", "parse_mode": "Markdown"}
+    payload = {"chat_id": cid, "text": f"`{ca}`", "parse_mode": "Markdown"}
     try: requests.post(url, json=payload, timeout=10)
     except: pass
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    buttons = [InlineKeyboardButton(f"📈 {s}", callback_data=f"info_{s}") for s in TOKENIZED_STOCKS]
-    keyboard = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        f"🤖 BOT 20 xSTOCKS ACTIVO\n\nMonitoreando: {', '.join(TOKENIZED_STOCKS)}\n\nToca una para verificar:",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    symbol = query.data.replace("info_", "")
-    await query.message.reply_text(f"✅ {symbol} monitoreada. Alertas automáticas activas.")
-
-def run_telegram_bot():
-    async def run():
-        app = Application.builder().token(TELEGRAM_TOKEN).build()
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CallbackQueryHandler(button_callback))
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
-        while True: await asyncio.sleep(3600)
-    asyncio.run(run())
+def handle_telegram():
+    offset = 0
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={offset}&timeout=20"
+            r = requests.get(url, timeout=25).json()
+            for upd in r.get("result", []):
+                offset = upd["update_id"] + 1
+                if "message" in upd and upd["message"].get("text") == "/start":
+                    chat = upd["message"]["chat"]["id"]
+                    buttons = [[{"text": f"📈 {s}", "callback_data": f"info_{s}"}] for s in TOKENIZED_STOCKS]
+                    # 2 por fila
+                    keyboard = []
+                    for i in range(0, len(buttons), 2):
+                        keyboard.append(buttons[i:i+1][0] if i+1 >= len(buttons) else [buttons[i][0], buttons[i+1][0]])
+                    markup = {"inline_keyboard": keyboard}
+                    send_telegram(f"🤖 *BOT 20 xSTOCKS ACTIVO*\n\nMonitoreando: {', '.join(TOKENIZED_STOCKS)}\n\nToca una para verificar:", chat_id=chat, reply_markup=markup)
+                if "callback_query" in upd:
+                    cq = upd["callback_query"]; chat = cq["message"]["chat"]["id"]; data = cq.get("data","")
+                    sym = data.replace("info_", "")
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery", json={"callback_query_id": cq["id"]}, timeout=10)
+                    send_telegram(f"✅ *{sym}* monitoreada. Alertas automáticas activas.\nFiltros: Liq $6k-$80k | Edad 10m-18h | SCORE >75", chat_id=chat)
+        except Exception as e:
+            print(f"Telegram loop error: {e}"); time.sleep(5)
 
 def check_pools():
     while True:
@@ -85,13 +86,15 @@ def check_pools():
                 gecko_link = f"https://www.geckoterminal.com/robinhood/pools/{pool_address}"
                 msg = f"🚀 *NUEVA JOYA xSTOCK DETECTADA* 🚀\n\n*Pool:* {name}\n*Liquidez:* ${reserve_usd:.0f}\n*Buys 1h:* {buys_h1} | *Sells:* {sells_h1} | *Ratio:* {ratio:.1f}x\n*Vol 5m:* ${vol_m5:.0f} | *Vol 1h:* ${vol_h1:.0f}\n*Edad:* {int(age_minutes)} min\n*SCORE:* {score}/100\n\n{gecko_link}"
                 send_telegram(msg); time.sleep(1); send_telegram_ca(ca)
-                alerted_cas[ca] = datetime.now()
+                alerted_cas[ca] = datetime.now(); print(f"Alerta: {name} {score}")
             time.sleep(20)
         except Exception as e: print(f"Error: {e}"); time.sleep(30)
 
 app = Flask(__name__)
 @app.route('/')
 def home(): return "Bot 20 xStocks Activo - OK"
+
 threading.Thread(target=check_pools, daemon=True).start()
-threading.Thread(target=run_telegram_bot, daemon=True).start()
+threading.Thread(target=handle_telegram, daemon=True).start()
+
 if __name__ == "__main__": app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
